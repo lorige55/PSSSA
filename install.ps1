@@ -1,113 +1,99 @@
-# Ensure admin
-if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(`
-    [Security.Principal.WindowsBuiltInRole] "Administrator")) {
-    Write-Warning "Please run this script as Administrator."
-    exit
-}
+# --- Force TLS 1.2 for GitHub downloads ---
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-# Variables
-$TempPath = "$env:TEMP\AppInstallers"
-$SyspinUrl = "https://github.com/PFCKrutonium/Windows-10-Taskbar-Pinning/releases/latest/download/syspin.exe"
-$SyspinPath = "$TempPath\syspin.exe"
-
-# Create temp directory
+# Temp folder
+$TempPath = Join-Path $env:TEMP "AppInstallers"
 New-Item -ItemType Directory -Force -Path $TempPath | Out-Null
 
-# Download syspin.exe
-Write-Host "Downloading syspin.exe..."
-Invoke-WebRequest -Uri $SyspinUrl -OutFile $SyspinPath -UseBasicParsing
+# Where we want syspin to be (if downloaded)
+$SyspinPath   = Join-Path $TempPath "syspin.exe"
+$LocalSyspin1 = Join-Path $PSScriptRoot "syspin.exe"   # fallback: same folder as the script
+$LocalSyspin2 = Join-Path (Get-Location) "syspin.exe"  # fallback: current working dir
+$SyspinDownloaded = $false
 
-if (!(Test-Path $SyspinPath)) {
-    Write-Error "Failed to download syspin.exe. Aborting."
-    exit
+# Direct URLs (no redirect) then a releases link as last resort
+$SyspinUrls = @(
+  "https://github.com/PFCKrutonium/Windows-10-Taskbar-Pinning/raw/master/syspin.exe",
+  "https://raw.githubusercontent.com/PFCKrutonium/Windows-10-Taskbar-Pinning/master/syspin.exe",
+  "https://github.com/PFCKrutonium/Windows-10-Taskbar-Pinning/releases/latest/download/syspin.exe"
+)
+
+function Get-Syspin {
+    param([string[]]$Urls)
+
+    # 1) Try local copies first (useful on locked-down networks)
+    foreach ($p in @($LocalSyspin1, $LocalSyspin2)) {
+        if (Test-Path $p -PathType Leaf) {
+            Write-Host "Using local syspin.exe at: $p"
+            return $p
+        }
+    }
+
+    # 2) Try to download from the list of URLs
+    foreach ($u in $Urls) {
+        try {
+            Write-Host "Downloading syspin.exe from $u ..."
+            Invoke-WebRequest -Uri $u -OutFile $SyspinPath -UseBasicParsing -MaximumRedirection 5 -ErrorAction Stop
+            if ((Test-Path $SyspinPath) -and ((Get-Item $SyspinPath).Length -gt 0)) {
+                $script:SyspinDownloaded = $true
+                return $SyspinPath
+            }
+        } catch {
+            Write-Warning "Download failed from $u : $($_.Exception.Message)"
+        }
+    }
+
+    # 3) Last-ditch: BITS (often works behind some proxies)
+    try {
+        Write-Host "Trying BITS transfer for the first URL..."
+        Start-BitsTransfer -Source $Urls[0] -Destination $SyspinPath -ErrorAction Stop
+        if ((Test-Path $SyspinPath) -and ((Get-Item $SyspinPath).Length -gt 0)) {
+            $script:SyspinDownloaded = $true
+            return $SyspinPath
+        }
+    } catch {
+        Write-Warning "BITS transfer also failed: $($_.Exception.Message)"
+    }
+
+    return $null
 }
 
-# Function to install and pin apps
-function Install-App {
-    param (
-        [string]$Name,
-        [string]$Url,
-        [string]$InstallerPath,
-        [string]$SilentArgs,
-        [string]$ExeToPin
-    )
+$SyspinExe = Get-Syspin -Urls $SyspinUrls
+if (-not $SyspinExe) {
+    Write-Warning "Could not obtain syspin.exe. Pinning will be skipped, installs will continue."
+    $PinningEnabled = $false
+} else {
+    $PinningEnabled = $true
+}
 
-    Write-Host "Downloading $Name..."
-    Invoke-WebRequest -Uri $Url -OutFile $InstallerPath -UseBasicParsing
-
-    if (Test-Path $InstallerPath) {
-        Write-Host "Installing $Name..."
-        Start-Process -FilePath $InstallerPath -ArgumentList $SilentArgs -Wait -NoNewWindow
-        Remove-Item $InstallerPath -Force
-        Write-Host "$Name installed.`n"
-
-        if ($ExeToPin) {
-            Write-Host "Pinning $Name to taskbar..."
-            Start-Process -FilePath $SyspinPath -ArgumentList "`"$ExeToPin`"", "5386" -Wait
-        }
-    } else {
-        Write-Warning "Failed to download $Name."
+# Helper to pin (only if we have syspin)
+function Pin-ToTaskbar {
+    param([string]$PathToExeOrLnk, [string]$Label)
+    if ($PinningEnabled -and (Test-Path $PathToExeOrLnk)) {
+        Write-Host "Pinning $Label ..."
+        Start-Process -FilePath $SyspinExe -ArgumentList "`"$PathToExeOrLnk`"", "5386" -Wait
+    } elseif ($PinningEnabled) {
+        Write-Warning "Could not find path to pin for $Label: $PathToExeOrLnk"
     }
 }
 
-# --- Unpin all current taskbar items ---
-Write-Host "Unpinning current taskbar items..."
-$taskbarPath = "$env:APPDATA\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"
-if (Test-Path $taskbarPath) {
-    Get-ChildItem $taskbarPath -Include *.lnk -Force | Remove-Item -Force
-}
-Stop-Process -Name explorer -Force
-Start-Process explorer
-
-# --- Pin File Explorer first ---
-$explorer = "$env:WINDIR\explorer.exe"
-Write-Host "Pinning File Explorer..."
-Start-Process -FilePath $SyspinPath -ArgumentList "`"$explorer`"", "5386" -Wait
-
-# --- 1. Firefox ---
-Install-App -Name "Firefox" `
-    -Url "https://download.mozilla.org/?product=firefox-latest&os=win64&lang=en-US" `
-    -InstallerPath "$TempPath\Firefox.exe" `
-    -SilentArgs "/S" `
-    -ExeToPin "C:\Program Files\Mozilla Firefox\firefox.exe"
-
-# --- 2. AnyDesk ---
-Install-App -Name "AnyDesk" `
-    -Url "https://download.anydesk.com/AnyDesk.exe" `
-    -InstallerPath "$TempPath\AnyDesk.exe" `
-    -SilentArgs "--install" `
-    -ExeToPin "C:\Program Files (x86)\AnyDesk\AnyDesk.exe"
-
-# --- 3. PDF24 Creator ---
-Install-App -Name "PDF24 Creator" `
-    -Url "https://tools.pdf24.org/static/builds/pdf24-creator.exe" `
-    -InstallerPath "$TempPath\PDF24.exe" `
-    -SilentArgs "/VERYSILENT" `
-    -ExeToPin "C:\Program Files\PDF24\pdf24.exe"
-
-# --- 4. Adobe Acrobat Reader ---
-Install-App -Name "Adobe Acrobat Reader" `
-    -Url "https://ardownload2.adobe.com/pub/adobe/reader/win/AcrobatDC/2300820419/AcroRdrDC2300820419_en_US.exe" `
-    -InstallerPath "$TempPath\AdobeReader.exe" `
-    -SilentArgs "/sAll /rs /rps /msi EULA_ACCEPT=YES" `
-    -ExeToPin "C:\Program Files (x86)\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe"
-
-# --- 5. WhatsApp via winget ---
-Write-Host "Installing WhatsApp (via winget)..."
-Start-Process "winget" -ArgumentList "install -e --id 9NKSQGP7F2NH --accept-package-agreements --accept-source-agreements" -Wait
-
-# Try to pin WhatsApp if the .lnk exists
-$whatsappLnk = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\WhatsApp.lnk"
-if (Test-Path $whatsappLnk) {
-    Write-Host "Pinning WhatsApp..."
-    Start-Process -FilePath $SyspinPath -ArgumentList "`"$whatsappLnk`"", "5386" -Wait
-} else {
-    Write-Warning "WhatsApp shortcut not found for pinning."
+# Example usage in your script:
+# 1) unpin current items (your existing logic)
+# 2) Pin File Explorer first:
+if ($PinningEnabled) {
+    Pin-ToTaskbar -PathToExeOrLnk "$env:WINDIR\explorer.exe" -Label "File Explorer"
 }
 
-# --- Clean up ---
-Write-Host "Cleaning up..."
-Remove-Item $SyspinPath -Force -ErrorAction SilentlyContinue
-Remove-Item $TempPath -Recurse -Force -ErrorAction SilentlyContinue
+# Later, after each app installs, call:
+# Pin-ToTaskbar -PathToExeOrLnk "C:\Program Files\Mozilla Firefox\firefox.exe" -Label "Firefox"
+# Pin-ToTaskbar -PathToExeOrLnk "C:\Program Files (x86)\AnyDesk\AnyDesk.exe" -Label "AnyDesk"
+# Pin-ToTaskbar -PathToTaskbar "C:\Program Files\PDF24\pdf24.exe" -Label "PDF24 Creator"
+# Pin-ToTaskbar -PathToExeOrLnk "C:\Program Files (x86)\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe" -Label "Adobe Reader"
+# For WhatsApp after winget install, try the Start Menu link:
+# Pin-ToTaskbar -PathToExeOrLnk "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\WhatsApp.lnk" -Label "WhatsApp"
 
-Write-Host "`n✅ All programs installed and pinned. Script complete."
+# --- Clean up downloaded syspin when finished ---
+if ($SyspinDownloaded -and (Test-Path $SyspinExe)) {
+    Write-Host "Cleaning up syspin.exe ..."
+    Remove-Item $SyspinExe -Force -ErrorAction SilentlyContinue
+}
